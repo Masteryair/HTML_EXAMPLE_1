@@ -21,7 +21,7 @@ body {
 
 .container-1080p {
   width: 1536px;
-  height: 864px;
+  height: 600px;
   margin: 0 auto;
   background: var(--panel-bg);
   border: 3.2px solid var(--border);
