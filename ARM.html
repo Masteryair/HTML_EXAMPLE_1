@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="he">
+<head>
+    <meta charset="UTF-8">
+    <title>זרוע רובוטית חכמה - עקיפת מכשולים</title>
+    <style>
+        body { margin: 0; background: #121212; color: white; overflow: hidden; font-family: sans-serif; }
+        canvas { display: block; cursor: crosshair; }
+        .info { position: absolute; top: 20px; left: 20px; pointer-events: none; background: rgba(0,0,0,0.5); padding: 15px; border-radius: 8px;}
+        h2 { margin: 0 0 10px 0; color: #00f2fe; }
+        .status { font-weight: bold; }
+        .ok { color: #00f2fe; }
+        .fail { color: #ff0055; }
+    </style>
+</head>
+<body>
+    <div class="info">
+        <h2>בקרת זרוע דינמית</h2>
+        <p>הזרוע מחשבת שתי קונפיגורציות (מרפק מעלה/מטה)</p>
+        <p>ובוחרת אוטומטית במסלול הפנוי ממכשולים.</p>
+        <div id="statusText" class="status ok">סטטוס: תקין</div>
+    </div>
+    <canvas id="robotCanvas"></canvas>
+
+    <script>
+        const canvas = document.getElementById('robotCanvas');
+        const ctx = canvas.getContext('2d');
+        const statusText = document.getElementById('statusText');
+
+        let width, height, centerX, centerY;
+        const L1 = 160;
+        const L2 = 130;
+        let mouseX = 0, mouseY = 0;
+
+        // הגדרת מכשולים (עיגולים)
+        let obstacles = [];
+
+        function initObstacles() {
+             obstacles = [
+                { x: centerX + 100, y: centerY - 100, r: 50, color: '#ffaa00' },
+                { x: centerX - 120, y: centerY + 80, r: 60, color: '#ffaa00' },
+                { x: centerX + 150, y: centerY + 150, r: 40, color: '#ffaa00' }
+            ];
+        }
+
+        function resize() {
+            width = window.innerWidth;
+            height = window.innerHeight;
+            canvas.width = width;
+            canvas.height = height;
+            centerX = width / 2;
+            centerY = height / 2;
+            initObstacles();
+        }
+
+        window.addEventListener('resize', resize);
+        window.addEventListener('mousemove', (e) => { mouseX = e.clientX; mouseY = e.clientY; });
+
+        // --- פונקציות עזר לחישובים גיאומטריים ---
+
+        // חישוב מרחק בריבוע מנקודה לקטע ישר (לזיהוי התנגשות)
+        function distToSegmentSquared(p, v, w) {
+            const l2 = (w.x - v.x)**2 + (w.y - v.y)**2;
+            if (l2 === 0) return (p.x - v.x)**2 + (p.y - v.y)**2;
+            let t = ((p.x - v.x) * (w.x - v.x) + (p.y - v.y) * (w.y - v.y)) / l2;
+            t = Math.max(0, Math.min(1, t));
+             const projectionX = v.x + t * (w.x - v.x);
+             const projectionY = v.y + t * (w.y - v.y);
+            return (p.x - projectionX)**2 + (p.y - projectionY)**2;
+        }
+
+        // בדיקה האם קונפיגורציית זרוע מתנגשת במכשול כלשהו
+        function checkCollision(joints) {
+            const pBase = { x: centerX, y: centerY };
+            const pJoint1 = { x: joints.j1x, y: joints.j1y };
+            const pEnd = { x: joints.endX, y: joints.endY };
+
+            for (const obs of obstacles) {
+                const obsCenter = { x: obs.x, y: obs.y };
+                // בדיקת התנגשות לזרוע 1
+                if (distToSegmentSquared(obsCenter, pBase, pJoint1) < (obs.r + 5)**2) return true;
+                // בדיקת התנגשות לזרוע 2
+                if (distToSegmentSquared(obsCenter, pJoint1, pEnd) < (obs.r + 5)**2) return true;
+            }
+            return false;
+        }
+
+        // --- הליבה: חישוב שני פתרונות קינמטיקה הפוכה ---
+        function solveIK_DualSolutions(targetX, targetY) {
+            let x = targetX - centerX;
+            let y = targetY - centerY;
+            const dist = Math.sqrt(x*x + y*y);
+            const maxDist = L1 + L2 - 0.1;
+            
+            // אם היעד רחוק מדי, נקצר אותו למקסימום האפשרי
+            if (dist > maxDist) {
+                const ratio = maxDist / dist;
+                x *= ratio; y *= ratio;
+            }
+
+            // חוק הקוסינוסים למציאת זווית המרפק
+            const cosAngle2 = (x*x + y*y - L1*L1 - L2*L2) / (2 * L1 * L2);
+            const clampedCosAngle2 = Math.max(-1, Math.min(1, cosAngle2)); // מניעת שגיאות חישוב
+            const angle2_base = Math.acos(clampedCosAngle2);
+
+            // *** כאן נוצרים שני הפתרונות ***
+            // פתרון 1: זווית מרפק חיובית
+            const a2_sol1 = angle2_base;
+            const a1_sol1 = Math.atan2(y, x) - Math.atan2(L2 * Math.sin(a2_sol1), L1 + L2 * Math.cos(a2_sol1));
+
+            // פתרון 2: זווית מרפק שלילית (הכיוון השני)
+            const a2_sol2 = -angle2_base;
+            const a1_sol2 = Math.atan2(y, x) - Math.atan2(L2 * Math.sin(a2_sol2), L1 + L2 * Math.cos(a2_sol2));
+
+            return [
+                calculateJointPos(a1_sol1, a2_sol1), // Solution A
+                calculateJointPos(a1_sol2, a2_sol2)  // Solution B
+            ];
+        }
+
+        function calculateJointPos(a1, a2) {
+            const j1x = centerX + L1 * Math.cos(a1);
+            const j1y = centerY + L1 * Math.sin(a1);
+            const endX = j1x + L2 * Math.cos(a1 + a2);
+            const endY = j1y + L2 * Math.sin(a1 + a2);
+            return { a1, a2, j1x, j1y, endX, endY };
+        }
+
+        // --- לולאת הציור הראשית ---
+        let currentSolutionIndex = 0; // זוכר באיזה פתרון השתמשנו לאחרונה כדי לשמור על רציפות
+
+        function draw() {
+            ctx.clearRect(0, 0, width, height);
+
+            // 1. ציור מכשולים
+            obstacles.forEach(obs => {
+                ctx.beginPath();
+                ctx.arc(obs.x, obs.y, obs.r, 0, Math.PI * 2);
+                ctx.fillStyle = '#333'; ctx.fill();
+                ctx.lineWidth = 3; ctx.strokeStyle = obs.color; ctx.stroke();
+                // תוספת ויזואלית - איזור סכנה
+                 ctx.beginPath(); ctx.arc(obs.x, obs.y, obs.r + 5, 0, Math.PI * 2);
+                 ctx.strokeStyle = 'rgba(255, 170, 0, 0.3)'; ctx.stroke();
+            });
+
+            // 2. חישוב שני הפתרונות
+            const solutions = solveIK_DualSolutions(mouseX, mouseY);
+            const solA = solutions[0];
+            const solB = solutions[1];
+
+            // 3. בדיקת התנגשויות וקבלת החלטות
+            const collideA = checkCollision(solA);
+            const collideB = checkCollision(solB);
+
+            let finalSol;
+            let isFail = false;
+
+            if (!collideA && !collideB) {
+                // שניהם תקינים - נשאר עם הפתרון הקודם כדי למנוע קפיצות מיותרות
+                finalSol = solutions[currentSolutionIndex];
+            } else if (!collideA) {
+                // רק A תקין
+                finalSol = solA;
+                currentSolutionIndex = 0;
+            } else if (!collideB) {
+                // רק B תקין
+                finalSol = solB;
+                currentSolutionIndex = 1;
+            } else {
+                // שניהם מתנגשים - מצב כשל
+                finalSol = solutions[currentSolutionIndex]; // נציג את האחרון שניסינו
+                isFail = true;
+            }
+
+            // עדכון סטטוס
+            if (isFail) {
+                statusText.textContent = "סטטוס: התנגשות!";
+                statusText.className = "status fail";
+            } else {
+                statusText.textContent = "סטטוס: תקין (נתיב אופטימלי)";
+                statusText.className = "status ok";
+            }
+
+            // 4. ציור הזרוע הסופית
+            drawArm(finalSol, isFail ? '#ff0055' : '#00f2fe');
+            
+            // (אופציונלי: ציור "רוח רפאים" של הפתרון האלטרנטיבי)
+             const altSol = currentSolutionIndex === 0 ? solB : solA;
+             if (!isFail && (collideA !== collideB)) {
+                  drawArm(altSol, 'rgba(255,255,255,0.1)', true);
+             }
+
+            requestAnimationFrame(draw);
+        }
+
+        function drawArm(config, color, isGhost = false) {
+            ctx.lineCap = 'round';
+            ctx.shadowBlur = isGhost ? 0 : 15;
+            ctx.shadowColor = color;
+            ctx.lineWidth = isGhost ? 4 : 12;
+
+            ctx.beginPath();
+            ctx.moveTo(centerX, centerY);
+            ctx.lineTo(config.j1x, config.j1y);
+            ctx.lineTo(config.endX, config.endY);
+            ctx.strokeStyle = color;
+            ctx.stroke();
+            
+            if(!isGhost){
+                 ctx.shadowBlur = 0; ctx.fillStyle = 'white';
+                 ctx.beginPath(); ctx.arc(centerX, centerY, 8, 0, Math.PI*2); ctx.fill();
+                 ctx.beginPath(); ctx.arc(config.j1x, config.j1y, 6, 0, Math.PI*2); ctx.fill();
+                 ctx.beginPath(); ctx.arc(config.endX, config.endY, 4, 0, Math.PI*2); ctx.fill();
+            }
+        }
+
+        resize();
+        draw();
+    </script>
+</body>
+</html>
